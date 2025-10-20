@@ -7,3 +7,4 @@ Step 2:
 To install required libraries run below command.
 pip install -r requirements.txt
 
+Step 3: Make sure the images/Dataset directory on your computer has the dataset files, obtain them from onedrive if you havent already.
