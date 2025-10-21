@@ -116,8 +116,15 @@ def read_full(path: str, to_hwc: bool = True, check_memory: bool = True):
             item = np.dtype(src.dtypes[0]).itemsize
         need = int(w) * int(h) * int(b) * int(item)
         avail = psutil.virtual_memory().available
+        # Convert bytes to gigabytes for clearer messaging
+        need_gb = need / (1024 ** 3)
+        avail_gb = avail / (1024 ** 3)
         if need * 1.1 > avail:
-            raise MemoryError(f"Not enough RAM to read full image: need {need}, avail {avail}")
+            raise MemoryError(
+                f"Not enough RAM to read full image: need {need} bytes ({need_gb:.2f} GB), "
+                f"available {avail} bytes ({avail_gb:.2f} GB). "
+                "Try increasing available memory or use `read_preview()`/rasterio to read a smaller window."
+            )
 
     if _HAS_RASTERIO:
         with rasterio.open(path) as src:
