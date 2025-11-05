@@ -623,3 +623,138 @@ def plot_genotype_transpiration_df(df: pd.DataFrame, genotype: str, figsize=(12,
         fig.savefig(save_path, bbox_inches="tight")
     
     return fig, ax
+
+
+def read_weather_station_csv(weather_csv_path: str, experiment_num: int, resample_freq: str = "2H") -> pd.DataFrame:
+    """Read a weather station CSV and resample to regular intervals.
+
+    This function:
+      1. Reads the weather station CSV (one experiment at a time)
+      2. Resamples weather measurements to regular intervals (default 2 hours)
+      3. Calculates mean values for each interval
+      4. Adds 'Days' column for days since experiment start
+
+    Args:
+      weather_csv_path: Path to a single weather station CSV file (e.g., CamelinaMAGIC1.0-WeatherStation.csv)
+      experiment_num: Experiment number (1, 2, or 3)
+      resample_freq: Resample frequency (default "2H" for 2 hours)
+
+    Returns:
+      A pandas DataFrame with columns:
+        - Days: Days since experiment start
+        - PARLight: Photosynthetically Active Radiation (µmol/m²/s)
+        - RH: Relative Humidity (%)
+        - Temp: Temperature (°C)
+        - VPD: Vapor Pressure Deficit (kPa)
+        - Experiment: Experiment number (1, 2, or 3)
+    """
+    
+    # Validate path
+    if not os.path.exists(weather_csv_path):
+        raise FileNotFoundError(f"Weather station CSV not found: {weather_csv_path}")
+    
+    # Read the weather CSV
+    df_weather = pd.read_csv(weather_csv_path)
+    if "Timestamp" not in df_weather.columns:
+        raise ValueError("Expected a 'Timestamp' column in the weather CSV")
+    
+    # Parse timestamps and set as index
+    df_weather["Timestamp"] = pd.to_datetime(df_weather["Timestamp"])
+    df_weather = df_weather.set_index("Timestamp").sort_index()
+    
+    # Rename columns to simpler names (remove the full prefix)
+    column_mapping = {}
+    for col in df_weather.columns:
+        if 'PARLight' in col:
+            column_mapping[col] = 'PARLight'
+        elif 'RH' in col:
+            column_mapping[col] = 'RH'
+        elif 'Temp' in col:
+            column_mapping[col] = 'Temp'
+        elif 'VPD' in col:
+            column_mapping[col] = 'VPD'
+    
+    df_weather = df_weather.rename(columns=column_mapping)
+    
+    # Convert all columns to numeric
+    df_weather = df_weather.apply(pd.to_numeric, errors="coerce")
+    
+    # Resample to the requested frequency (take mean of each interval)
+    df_resampled = df_weather.resample(resample_freq, label="left", closed="left").mean()
+    
+    # Calculate days since experiment start
+    days_since_start = (df_resampled.index - df_resampled.index.min()).total_seconds() / (24 * 3600)
+    df_resampled["Days"] = days_since_start
+    
+    # Add experiment number
+    df_resampled['Experiment'] = experiment_num
+    
+    # Reset index to have Days as a regular column
+    df_resampled = df_resampled.reset_index(drop=True)
+    
+    # Reorder columns for clarity
+    df_resampled = df_resampled[['Days', 'PARLight', 'RH', 'Temp', 'VPD', 'Experiment']]
+    
+    # Remove rows with all NaN values
+    df_resampled = df_resampled.dropna(how='all', subset=['PARLight', 'RH', 'Temp', 'VPD'])
+    
+    return df_resampled
+
+
+def plot_weather_station_data(df: pd.DataFrame, figsize=(12, 10), title=None, save_path=None):
+    """Plot weather station data with multiple subplots for each climate variable.
+    
+    Creates a 4-panel plot showing:
+      - PAR Light (Photosynthetically Active Radiation)
+      - Relative Humidity
+      - Temperature
+      - Vapor Pressure Deficit
+
+    Args:
+      df: DataFrame from read_weather_station_csv (should contain one experiment)
+      figsize: Figure size (width, height)
+      title: Optional plot title
+      save_path: Optional path to save the figure
+
+    Returns:
+      (fig, axes) tuple of the created Matplotlib objects.
+    """
+    
+    if df is None or df.empty:
+        raise ValueError("DataFrame is empty or None")
+    
+    fig, axes = plt.subplots(4, 1, figsize=figsize, sharex=True)
+    
+    # Plot PAR Light
+    axes[0].plot(df['Days'], df['PARLight'], color='#ff7f0e', linewidth=1)
+    axes[0].set_ylabel('PAR Light\n(µmol/m²/s)')
+    axes[0].grid(True, alpha=0.3)
+    
+    # Plot Relative Humidity
+    axes[1].plot(df['Days'], df['RH'], color='#2ca02c', linewidth=1)
+    axes[1].set_ylabel('Relative Humidity\n(%)')
+    axes[1].grid(True, alpha=0.3)
+    
+    # Plot Temperature
+    axes[2].plot(df['Days'], df['Temp'], color='#d62728', linewidth=1)
+    axes[2].set_ylabel('Temperature\n(°C)')
+    axes[2].grid(True, alpha=0.3)
+    
+    # Plot VPD
+    axes[3].plot(df['Days'], df['VPD'], color='#9467bd', linewidth=1)
+    axes[3].set_ylabel('VPD\n(kPa)')
+    axes[3].set_xlabel('Days since experiment start')
+    axes[3].grid(True, alpha=0.3)
+    
+    if title:
+        fig.suptitle(title, fontsize=14, fontweight='bold')
+    else:
+        exp_num = df['Experiment'].iloc[0]
+        fig.suptitle(f"Weather Station Data - Experiment {exp_num}", fontsize=14, fontweight='bold')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight")
+    
+    return fig, axes
