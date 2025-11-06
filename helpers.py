@@ -2,6 +2,8 @@ import os
 
 import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
 
 
 def read_weight_csv(weight_csv_path: str, randomization_path: str, experiment_num: int, resample_freq: str = "2H") -> pd.DataFrame:
@@ -758,3 +760,117 @@ def plot_weather_station_data(df: pd.DataFrame, figsize=(12, 10), title=None, sa
         fig.savefig(save_path, bbox_inches="tight")
     
     return fig, axes
+
+
+def plot_weather_station_data_enhanced(dataframes_dict, show_debug=False):
+    """Plot enhanced weather station data with daily min/max/mean statistics.
+    
+    Creates two types of plots for each experiment:
+      1. Combined overlay plot showing all climate variables
+      2. Individual subplot grid with shaded min/max regions
+    
+    Args:
+      dataframes_dict: Dictionary mapping experiment names to weather DataFrames
+                      e.g., {"Experiment 1": weather_df_1, "Experiment 2": weather_df_2}
+      show_debug: If True, prints debug information during processing
+    
+    Returns:
+      None (displays plots)
+    """
+    
+    for exp_name, df in dataframes_dict.items():
+        if df is None or df.empty:
+            print(f"Skipping {exp_name}: DataFrame is empty or None")
+            continue
+        
+        if show_debug:
+            print(f"\n{'='*60}")
+            print(f"Processing: {exp_name}")
+            print(f"{'='*60}")
+        
+        # Find the days column dynamically
+        days_col = [col for col in df.columns if 'day' in col.lower()]
+        if not days_col:
+            print(f"Warning: No 'Days' column found in {exp_name}")
+            continue
+        days_col = days_col[0]
+        
+        if show_debug:
+            print(f"Days column: {days_col}")
+        
+        # Get all numeric climate variables (exclude the Days column)
+        climate_vars = [col for col in df.select_dtypes(include=[np.number]).columns if col != days_col and col != 'Experiment']        
+        if show_debug:
+            print(f"Climate variables found: {climate_vars}")
+        
+        # Create integer day groups
+        df['day_integer'] = np.floor(df[days_col]).astype(int)
+        
+        # Calculate daily statistics
+        daily_stats = df.groupby('day_integer')[climate_vars].agg(['min', 'max', 'mean'])
+        
+        if show_debug:
+            print(f"\nDaily statistics shape: {daily_stats.shape}")
+            print(f"Day range: {daily_stats.index.min()} to {daily_stats.index.max()}")
+        
+        # Plot 1: Combined overlay plot
+        fig1, ax1 = plt.subplots(figsize=(14, 6))
+        
+        colors = sns.color_palette("husl", len(climate_vars))
+        
+        for i, var in enumerate(climate_vars):
+            ax1.plot(daily_stats.index, daily_stats[(var, 'min')], 
+                    label=f'{var} (min)', color=colors[i], linestyle='--', alpha=0.6)
+            ax1.plot(daily_stats.index, daily_stats[(var, 'max')], 
+                    label=f'{var} (max)', color=colors[i], linestyle=':', alpha=0.6)
+            ax1.plot(daily_stats.index, daily_stats[(var, 'mean')], 
+                    label=f'{var} (mean)', color=colors[i], linewidth=2)
+        
+        ax1.set_xlabel('Day (integer)')
+        ax1.set_ylabel('Climate Variable Values')
+        ax1.set_title(f'{exp_name} - All Climate Variables (Daily Min/Max/Mean)')
+        ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left', ncol=1)
+        ax1.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+        
+        # Plot 2: Individual subplots with shaded regions
+        n_vars = len(climate_vars)
+        fig2, axes = plt.subplots(n_vars, 1, figsize=(14, 3*n_vars), sharex=True)
+        
+        # Handle single variable case
+        if n_vars == 1:
+            axes = [axes]
+        
+        for i, var in enumerate(climate_vars):
+            ax = axes[i]
+            
+            # Plot mean line
+            ax.plot(daily_stats.index, daily_stats[(var, 'mean')], 
+                   label='Mean', color='blue', linewidth=2)
+            
+            # Shade the min/max region
+            ax.fill_between(daily_stats.index, 
+                           daily_stats[(var, 'min')], 
+                           daily_stats[(var, 'max')],
+                           alpha=0.3, color='lightblue', label='Min-Max Range')
+            
+            # Plot min and max lines
+            ax.plot(daily_stats.index, daily_stats[(var, 'min')], 
+                   label='Min', color='blue', linestyle='--', alpha=0.6)
+            ax.plot(daily_stats.index, daily_stats[(var, 'max')], 
+                   label='Max', color='blue', linestyle=':', alpha=0.6)
+            
+            ax.set_ylabel(var)
+            ax.legend(loc='best')
+            ax.grid(True, alpha=0.3)
+        
+        axes[-1].set_xlabel('Day (integer)')
+        fig2.suptitle(f'{exp_name} - Daily Min/Max/Mean for Each Climate Variable', 
+                     fontsize=14, fontweight='bold', y=1.001)
+        plt.tight_layout()
+        plt.show()
+        
+        if show_debug:
+            print(f"\nCompleted plots for {exp_name}")
+            print(f"{'='*60}\n")
