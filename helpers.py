@@ -814,7 +814,7 @@ def plot_weather_station_data_enhanced(dataframes_dict, show_debug=False):
             print(f"Day range: {daily_stats.index.min()} to {daily_stats.index.max()}")
         
         # Plot 1: Combined overlay plot
-        fig1, ax1 = plt.subplots(figsize=(14, 6))
+        _, ax1 = plt.subplots(figsize=(14, 6))
         
         colors = sns.color_palette("husl", len(climate_vars))
         
@@ -874,3 +874,120 @@ def plot_weather_station_data_enhanced(dataframes_dict, show_debug=False):
         if show_debug:
             print(f"\nCompleted plots for {exp_name}")
             print(f"{'='*60}\n")
+
+
+def get_random_samples_by_genotype(transpiration_dfs, genotypes):
+    """Select one random sample for each genotype across all experiments."""
+    all_data = pd.concat(transpiration_dfs)
+    results = {}
+    
+    for genotype in genotypes:
+        samples = all_data[all_data['Genotype'] == genotype]['Sample'].unique()
+        if len(samples) > 0:
+            sample_name = np.random.choice(samples)
+            sample_data = all_data[all_data['Sample'] == sample_name].sort_values('Days')
+            results[genotype] = (sample_name, sample_data)
+    
+    return results
+
+
+def calculate_mean_daily_change(data, start_day, end_day, column='Transpiration_Pct'):
+    """Calculate mean daily change in transpiration for a given period.
+    
+    Args:
+        data: DataFrame with transpiration data
+        start_day: Start day of the period
+        end_day: End day of the period
+        column: Column to calculate changes from (default 'Transpiration_Pct')
+    
+    Returns:
+        Tuple of (mean_change, total_change, days_in_period)
+    """
+    period_data = data[(data['Days'] >= start_day) & (data['Days'] <= end_day)].sort_values('Days')
+    
+    if len(period_data) < 2:
+        return None, None, None
+    
+    daily_changes = period_data[column].diff().dropna()
+    mean_change = daily_changes.mean()
+    total_change = period_data[column].iloc[-1] - period_data[column].iloc[0]
+    days_in_period = period_data['Days'].iloc[-1] - period_data['Days'].iloc[0]
+    
+    return mean_change, total_change, days_in_period
+
+
+def analyze_sample_periods(sample_data, sample_name, periods, use_percent=True):
+    """Analyze transpiration changes across multiple time periods.
+    
+    Args:
+        sample_data: DataFrame with transpiration data
+        sample_name: Name of the sample
+        periods: List of tuples (period_name, start_day, end_day)
+        use_percent: If True, calculate based on % of raw weight; if False, use g/day
+    
+    Returns:
+        Dictionary with analysis results
+    """
+    column = 'Transpiration_Pct' if use_percent else 'Transpiration'
+    unit = '% of raw weight' if use_percent else 'g'
+    
+    results = {
+        'sample': sample_name,
+        'experiment': sample_data['Experiment'].iloc[0],
+        'treatment': sample_data['Treatment'].iloc[0],
+        'genotype': sample_data['Genotype'].iloc[0],
+        'total_transpiration': sample_data['Transpiration'].sum(),
+        'mean_daily_transpiration': sample_data['Transpiration'].mean(),
+        'unit': unit,
+        'periods': {}
+    }
+    
+    for period_name, start_day, end_day in periods:
+        mean_change, total_change, days = calculate_mean_daily_change(sample_data, start_day, end_day, column)
+        results['periods'][period_name] = {
+            'mean_daily_change': mean_change,
+            'total_change': total_change,
+            'days': days
+        }
+    
+    return results
+
+
+def plot_sample_comparison(sample_dict, figsize=(12, 6)):
+    """Plot transpiration comparison for multiple samples."""
+    fig, ax = plt.subplots(figsize=figsize)
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']
+    
+    for idx, (genotype, (sample_name, data)) in enumerate(sample_dict.items()):
+        ax.plot(data['Days'], data['Transpiration'], 
+                label=f'{genotype} ({sample_name}, {data["Treatment"].iloc[0]})',
+                linewidth=2, marker=markers[idx % len(markers)], markersize=4)
+    
+    ax.set_xlabel('Days since experiment start', fontsize=12)
+    ax.set_ylabel('Daily Transpiration (g)', fontsize=12)
+    ax.set_title('Transpiration Comparison: Individual Samples', fontsize=14, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    return fig, ax
+
+
+def print_sample_analysis(analysis_results):
+    """Print formatted analysis results for a sample."""
+    unit = analysis_results.get('unit', 'g')
+    
+    print(f"\n{analysis_results['genotype']} Sample ({analysis_results['sample']}):")
+    print("-" * 80)
+    print(f"Experiment: {analysis_results['experiment']}")
+    print(f"Treatment: {analysis_results['treatment']}")
+    print(f"Total transpiration: {analysis_results['total_transpiration']:.2f} g")
+    print(f"Mean daily transpiration: {analysis_results['mean_daily_transpiration']:.2f} g")
+    
+    for period_name, period_data in analysis_results['periods'].items():
+        print(f"\n{period_name}:")
+        if period_data['mean_daily_change'] is not None:
+            print(f"  Mean daily change: {period_data['mean_daily_change']:.2f} {unit}/day")
+            print(f"  Total change: {period_data['total_change']:.2f} {unit} over {period_data['days']:.1f} days")
+        else:
+            print("  Insufficient data")
