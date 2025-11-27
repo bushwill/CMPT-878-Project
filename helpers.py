@@ -5,6 +5,85 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 
+# Constants
+GENOTYPE_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b',
+                   '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+TREATMENT_COLORS = {'Control': '#2ca02c', 'DR_100': '#d62728'}
+SAMPLE_PATTERN = r'(Camelina\d+)'
+
+
+def _load_randomization_maps(randomization_path: str, experiment_num: int) -> tuple[dict, dict]:
+    """Load treatment and genotype mappings from randomization file.
+    
+    Returns:
+        Tuple of (treatment_map, genotype_map) dictionaries
+    """
+    randomization = pd.read_excel(randomization_path)
+    experiment_name = f"CamelinaMAGIC_{experiment_num}.0"
+    exp_randomization = randomization[randomization['Experiment'] == experiment_name]
+    
+    treatment_map = dict(zip(exp_randomization['Name'], exp_randomization['Treatment']))
+    genotype_map = dict(zip(exp_randomization['Name'], exp_randomization['Genotype']))
+    
+    return treatment_map, genotype_map
+
+
+def _read_and_process_timeseries_csv(
+    csv_path: str,
+    randomization_path: str,
+    experiment_num: int,
+    value_column_name: str,
+    resample_freq: str = None
+) -> pd.DataFrame:
+    """Common logic for reading weight and transpiration CSVs.
+    
+    Args:
+        csv_path: Path to CSV file
+        randomization_path: Path to randomization Excel file
+        experiment_num: Experiment number (1, 2, or 3)
+        value_column_name: Name for the value column in output ('Weight' or 'Transpiration')
+        resample_freq: Optional resampling frequency (e.g., "2H")
+    
+    Returns:
+        Processed DataFrame in long format
+    """
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+    if not os.path.exists(randomization_path):
+        raise FileNotFoundError(f"Randomization file not found: {randomization_path}")
+    
+    df = pd.read_csv(csv_path)
+    if "Timestamp" not in df.columns:
+        raise ValueError("Expected a 'Timestamp' column in the CSV")
+    
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+    df = df.set_index("Timestamp").sort_index()
+    df = df.apply(pd.to_numeric, errors="coerce")
+    
+    if resample_freq:
+        df = df.resample(resample_freq, label="left", closed="left").mean()
+    
+    days_since_start = (df.index - df.index.min()).total_seconds() / (24 * 3600)
+    df["Days"] = days_since_start
+    df = df.reset_index(drop=True)
+    
+    treatment_map, genotype_map = _load_randomization_maps(randomization_path, experiment_num)
+    
+    df_long = pd.melt(
+        df,
+        id_vars=['Days'],
+        value_vars=[col for col in df.columns if col != 'Days'],
+        var_name='Sample_Column',
+        value_name=value_column_name
+    )
+    
+    df_long['Sample'] = df_long['Sample_Column'].str.extract(SAMPLE_PATTERN)[0]
+    df_long['Experiment'] = experiment_num
+    df_long['Treatment'] = df_long['Sample'].map(treatment_map)
+    df_long['Genotype'] = df_long['Sample'].map(genotype_map)
+    
+    return df_long[['Days', 'Sample', value_column_name, 'Experiment', 'Treatment', 'Genotype']].dropna(subset=[value_column_name])
+
 
 def read_weight_csv(weight_csv_path: str, randomization_path: str, experiment_num: int, resample_freq: str = "2H") -> pd.DataFrame:
     """Read a raw weight CSV and enrich it with experiment and treatment information.
@@ -31,77 +110,91 @@ def read_weight_csv(weight_csv_path: str, randomization_path: str, experiment_nu
         - Treatment: 'Control' or 'DR_100'
         - Genotype: Genotype name (e.g., 'Hoga', 'Blaine Creek', etc.)
     """
-    
-    # Validate paths
-    if not os.path.exists(weight_csv_path):
-        raise FileNotFoundError(f"Weight CSV not found: {weight_csv_path}")
-    if not os.path.exists(randomization_path):
-        raise FileNotFoundError(f"Randomization file not found: {randomization_path}")
-    
-    # Read the weight CSV
-    df_weight = pd.read_csv(weight_csv_path)
-    if "Timestamp" not in df_weight.columns:
-        raise ValueError("Expected a 'Timestamp' column in the weight CSV")
-    
-    # Parse timestamps and set as index
-    df_weight["Timestamp"] = pd.to_datetime(df_weight["Timestamp"])
-    df_weight = df_weight.set_index("Timestamp").sort_index()
-    
-    # Convert all columns to numeric
-    df_weight = df_weight.apply(pd.to_numeric, errors="coerce")
-    
-    # Resample to the requested frequency
-    df_resampled = df_weight.resample(resample_freq, label="left", closed="left").mean()
-    
-    # Calculate days since experiment start
-    days_since_start = (df_resampled.index - df_resampled.index.min()).total_seconds() / (24 * 3600)
-    df_resampled["Days"] = days_since_start
-    
-    # Read randomization file and filter for this experiment
-    randomization = pd.read_excel(randomization_path)
-    experiment_name = f"CamelinaMAGIC_{experiment_num}.0"
-    exp_randomization = randomization[randomization['Experiment'] == experiment_name].copy()
-    
-    # Create mappings of sample name to treatment and genotype
-    treatment_map = dict(zip(exp_randomization['Name'], exp_randomization['Treatment']))
-    genotype_map = dict(zip(exp_randomization['Name'], exp_randomization['Genotype']))
-    
-    # Transform from wide to long format
-    # Reset index to have Days as a column
-    df_resampled = df_resampled.reset_index(drop=True)
-    
-    # Melt the DataFrame to long format
-    id_vars = ['Days']
-    value_vars = [col for col in df_resampled.columns if col != 'Days']
-    
-    df_long = pd.melt(
-        df_resampled,
-        id_vars=id_vars,
-        value_vars=value_vars,
-        var_name='Sample_Column',
-        value_name='Weight'
+    return _read_and_process_timeseries_csv(
+        weight_csv_path, randomization_path, experiment_num, 'Weight', resample_freq
     )
+
+
+def _calculate_stats_with_ci(data: pd.DataFrame, group_col: str, value_col: str) -> pd.DataFrame:
+    """Calculate mean, std, and 95% confidence interval for grouped data.
     
-    # Extract sample name from column name (e.g., "Camelina01 - Weight (g)" -> "Camelina01")
-    df_long['Sample'] = df_long['Sample_Column'].str.extract(r'(Camelina\d+)')[0]
+    Args:
+        data: DataFrame to process
+        group_col: Column to group by (e.g., 'Days')
+        value_col: Column to calculate statistics for
     
-    # Add experiment number
-    df_long['Experiment'] = experiment_num
+    Returns:
+        DataFrame with mean, lower, and upper confidence bounds
+    """
+    stats = data.groupby(group_col)[value_col].agg(['mean', 'std', 'count']).reset_index()
+    # CI = mean ± 1.96 * (std / sqrt(n))
+    stats['ci'] = 1.96 * stats['std'] / np.sqrt(stats['count'])
+    stats['lower'] = stats['mean'] - stats['ci']
+    stats['upper'] = stats['mean'] + stats['ci']
+    return stats
+
+
+def _plot_by_genotype(
+    df: pd.DataFrame,
+    treatment: str,
+    value_col: str,
+    ylabel: str,
+    title_prefix: str,
+    figsize: tuple,
+    title: str = None,
+    save_path: str = None
+) -> tuple:
+    """Common plotting logic for genotype-based plots.
     
-    # Add treatment and genotype information
-    df_long['Treatment'] = df_long['Sample'].map(treatment_map)
-    df_long['Genotype'] = df_long['Sample'].map(genotype_map)
+    Args:
+        df: Input DataFrame
+        treatment: Treatment to filter ('Control' or 'DR_100')
+        value_col: Column name for values to plot ('Weight' or 'Transpiration')
+        ylabel: Y-axis label
+        title_prefix: Prefix for auto-generated title
+        figsize: Figure size tuple
+        title: Optional custom title
+        save_path: Optional path to save figure
     
-    # Drop the Sample_Column as we don't need it anymore
-    df_long = df_long.drop(columns=['Sample_Column'])
+    Returns:
+        Tuple of (fig, ax)
+    """
+    if df is None or df.empty:
+        raise ValueError("DataFrame is empty or None")
     
-    # Reorder columns for clarity
-    df_long = df_long[['Days', 'Sample', 'Weight', 'Experiment', 'Treatment', 'Genotype']]
+    df_filtered = df[df['Treatment'] == treatment].copy()
     
-    # Remove rows with NaN weights
-    df_long = df_long.dropna(subset=['Weight'])
+    if df_filtered.empty:
+        treatment_name = 'control' if treatment == 'Control' else 'drought'
+        raise ValueError(f"No {treatment_name} samples found in the DataFrame")
     
-    return df_long
+    fig, ax = plt.subplots(figsize=figsize)
+    genotypes = sorted(df_filtered['Genotype'].unique())
+    colors = [GENOTYPE_COLORS[i % len(GENOTYPE_COLORS)] for i in range(len(genotypes))]
+    
+    for i, genotype in enumerate(genotypes):
+        genotype_data = df_filtered[df_filtered['Genotype'] == genotype]
+        stats = _calculate_stats_with_ci(genotype_data, 'Days', value_col)
+        
+        ax.plot(stats['Days'], stats['mean'], label=genotype, color=colors[i], linewidth=2)
+        ax.fill_between(stats['Days'], stats['lower'], stats['upper'], color=colors[i], alpha=0.2)
+    
+    ax.set_xlabel("Days since experiment start")
+    ax.set_ylabel(ylabel)
+    ax.legend(loc='best', title='Genotype')
+    
+    if title:
+        ax.set_title(title)
+    else:
+        exp_num = df_filtered['Experiment'].iloc[0]
+        ax.set_title(f"{title_prefix} - Experiment {exp_num}")
+    
+    plt.tight_layout()
+    
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight")
+    
+    return fig, ax
 
 
 def plot_drought_weight_df(df: pd.DataFrame, figsize=(12, 6), title=None, save_path=None):
@@ -118,61 +211,10 @@ def plot_drought_weight_df(df: pd.DataFrame, figsize=(12, 6), title=None, save_p
     Returns:
       (fig, ax) tuple of the created Matplotlib objects.
     """
-    
-    if df is None or df.empty:
-        raise ValueError("DataFrame is empty or None")
-    
-    # Filter for drought samples only
-    df_drought = df[df['Treatment'] == 'DR_100'].copy()
-    
-    if df_drought.empty:
-        raise ValueError("No drought samples found in the DataFrame")
-    
-    fig, ax = plt.subplots(figsize=figsize)
-    
-    # Get unique genotypes and assign colors
-    genotypes = sorted(df_drought['Genotype'].unique())
-    # Use a predefined list of colors
-    color_list = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', 
-                  '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
-    colors = [color_list[i % len(color_list)] for i in range(len(genotypes))]
-    
-    # Plot each genotype
-    for i, genotype in enumerate(genotypes):
-        genotype_data = df_drought[df_drought['Genotype'] == genotype]
-        
-        # Calculate mean and std for each time point
-        stats = genotype_data.groupby('Days')['Weight'].agg(['mean', 'std', 'count']).reset_index()
-        
-        # Calculate 95% confidence interval
-        # CI = mean ± 1.96 * (std / sqrt(n))
-        stats['ci'] = 1.96 * stats['std'] / (stats['count'] ** 0.5)
-        stats['lower'] = stats['mean'] - stats['ci']
-        stats['upper'] = stats['mean'] + stats['ci']
-        
-        # Plot mean line
-        ax.plot(stats['Days'], stats['mean'], label=genotype, color=colors[i], linewidth=2)
-        
-        # Plot confidence interval as shaded area
-        ax.fill_between(stats['Days'], stats['lower'], stats['upper'], 
-                        color=colors[i], alpha=0.2)
-    
-    ax.set_xlabel("Days since experiment start")
-    ax.set_ylabel("Weight (g)")
-    ax.legend(loc='best', title='Genotype')
-    
-    if title:
-        ax.set_title(title)
-    else:
-        exp_num = df_drought['Experiment'].iloc[0]
-        ax.set_title(f"Drought Samples by Genotype - Experiment {exp_num}")
-    
-    plt.tight_layout()
-    
-    if save_path:
-        fig.savefig(save_path, bbox_inches="tight")
-    
-    return fig, ax
+    return _plot_by_genotype(
+        df, 'DR_100', 'Weight', 'Weight (g)',
+        'Drought Samples by Genotype', figsize, title, save_path
+    )
 
 
 def plot_control_weight_df(df: pd.DataFrame, figsize=(12, 6), title=None, save_path=None):
@@ -189,61 +231,10 @@ def plot_control_weight_df(df: pd.DataFrame, figsize=(12, 6), title=None, save_p
     Returns:
       (fig, ax) tuple of the created Matplotlib objects.
     """
-    
-    if df is None or df.empty:
-        raise ValueError("DataFrame is empty or None")
-    
-    # Filter for control samples only
-    df_control = df[df['Treatment'] == 'Control'].copy()
-    
-    if df_control.empty:
-        raise ValueError("No control samples found in the DataFrame")
-    
-    fig, ax = plt.subplots(figsize=figsize)
-    
-    # Get unique genotypes and assign colors
-    genotypes = sorted(df_control['Genotype'].unique())
-    # Use a predefined list of colors
-    color_list = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', 
-                  '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
-    colors = [color_list[i % len(color_list)] for i in range(len(genotypes))]
-    
-    # Plot each genotype
-    for i, genotype in enumerate(genotypes):
-        genotype_data = df_control[df_control['Genotype'] == genotype]
-        
-        # Calculate mean and std for each time point
-        stats = genotype_data.groupby('Days')['Weight'].agg(['mean', 'std', 'count']).reset_index()
-        
-        # Calculate 95% confidence interval
-        # CI = mean ± 1.96 * (std / sqrt(n))
-        stats['ci'] = 1.96 * stats['std'] / (stats['count'] ** 0.5)
-        stats['lower'] = stats['mean'] - stats['ci']
-        stats['upper'] = stats['mean'] + stats['ci']
-        
-        # Plot mean line
-        ax.plot(stats['Days'], stats['mean'], label=genotype, color=colors[i], linewidth=2)
-        
-        # Plot confidence interval as shaded area
-        ax.fill_between(stats['Days'], stats['lower'], stats['upper'], 
-                        color=colors[i], alpha=0.2)
-    
-    ax.set_xlabel("Days since experiment start")
-    ax.set_ylabel("Weight (g)")
-    ax.legend(loc='best', title='Genotype')
-    
-    if title:
-        ax.set_title(title)
-    else:
-        exp_num = df_control['Experiment'].iloc[0]
-        ax.set_title(f"Control Samples by Genotype - Experiment {exp_num}")
-    
-    plt.tight_layout()
-    
-    if save_path:
-        fig.savefig(save_path, bbox_inches="tight")
-    
-    return fig, ax
+    return _plot_by_genotype(
+        df, 'Control', 'Weight', 'Weight (g)',
+        'Control Samples by Genotype', figsize, title, save_path
+    )
 
 
 def read_transpiration_csv(transpiration_csv_path: str, randomization_path: str, experiment_num: int) -> pd.DataFrame:
@@ -269,74 +260,9 @@ def read_transpiration_csv(transpiration_csv_path: str, randomization_path: str,
         - Treatment: 'Control' or 'DR_100'
         - Genotype: Genotype name (e.g., 'Hoga', 'Blaine Creek', etc.)
     """
-    
-    # Validate paths
-    if not os.path.exists(transpiration_csv_path):
-        raise FileNotFoundError(f"Transpiration CSV not found: {transpiration_csv_path}")
-    if not os.path.exists(randomization_path):
-        raise FileNotFoundError(f"Randomization file not found: {randomization_path}")
-    
-    # Read the transpiration CSV
-    df_transpiration = pd.read_csv(transpiration_csv_path)
-    if "Timestamp" not in df_transpiration.columns:
-        raise ValueError("Expected a 'Timestamp' column in the transpiration CSV")
-    
-    # Parse timestamps and set as index
-    df_transpiration["Timestamp"] = pd.to_datetime(df_transpiration["Timestamp"])
-    df_transpiration = df_transpiration.set_index("Timestamp").sort_index()
-    
-    # Convert all columns to numeric
-    df_transpiration = df_transpiration.apply(pd.to_numeric, errors="coerce")
-    
-    # Calculate days since experiment start
-    days_since_start = (df_transpiration.index - df_transpiration.index.min()).total_seconds() / (24 * 3600)
-    df_transpiration["Days"] = days_since_start
-    
-    # Read randomization file and filter for this experiment
-    randomization = pd.read_excel(randomization_path)
-    experiment_name = f"CamelinaMAGIC_{experiment_num}.0"
-    exp_randomization = randomization[randomization['Experiment'] == experiment_name].copy()
-    
-    # Create mappings of sample name to treatment and genotype
-    treatment_map = dict(zip(exp_randomization['Name'], exp_randomization['Treatment']))
-    genotype_map = dict(zip(exp_randomization['Name'], exp_randomization['Genotype']))
-    
-    # Transform from wide to long format
-    # Reset index to have Days as a column
-    df_transpiration = df_transpiration.reset_index(drop=True)
-    
-    # Melt the DataFrame to long format
-    id_vars = ['Days']
-    value_vars = [col for col in df_transpiration.columns if col != 'Days']
-    
-    df_long = pd.melt(
-        df_transpiration,
-        id_vars=id_vars,
-        value_vars=value_vars,
-        var_name='Sample_Column',
-        value_name='Transpiration'
+    return _read_and_process_timeseries_csv(
+        transpiration_csv_path, randomization_path, experiment_num, 'Transpiration'
     )
-    
-    # Extract sample name from column name (e.g., "Camelina01 - Daily Transpiration (g)" -> "Camelina01")
-    df_long['Sample'] = df_long['Sample_Column'].str.extract(r'(Camelina\d+)')[0]
-    
-    # Add experiment number
-    df_long['Experiment'] = experiment_num
-    
-    # Add treatment and genotype information
-    df_long['Treatment'] = df_long['Sample'].map(treatment_map)
-    df_long['Genotype'] = df_long['Sample'].map(genotype_map)
-    
-    # Drop the Sample_Column as we don't need it anymore
-    df_long = df_long.drop(columns=['Sample_Column'])
-    
-    # Reorder columns for clarity
-    df_long = df_long[['Days', 'Sample', 'Transpiration', 'Experiment', 'Treatment', 'Genotype']]
-    
-    # Remove rows with NaN transpiration
-    df_long = df_long.dropna(subset=['Transpiration'])
-    
-    return df_long
 
 
 def plot_drought_transpiration_df(df: pd.DataFrame, figsize=(12, 6), title=None, save_path=None):
@@ -353,61 +279,10 @@ def plot_drought_transpiration_df(df: pd.DataFrame, figsize=(12, 6), title=None,
     Returns:
       (fig, ax) tuple of the created Matplotlib objects.
     """
-    
-    if df is None or df.empty:
-        raise ValueError("DataFrame is empty or None")
-    
-    # Filter for drought samples only
-    df_drought = df[df['Treatment'] == 'DR_100'].copy()
-    
-    if df_drought.empty:
-        raise ValueError("No drought samples found in the DataFrame")
-    
-    fig, ax = plt.subplots(figsize=figsize)
-    
-    # Get unique genotypes and assign colors
-    genotypes = sorted(df_drought['Genotype'].unique())
-    # Use a predefined list of colors
-    color_list = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', 
-                  '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
-    colors = [color_list[i % len(color_list)] for i in range(len(genotypes))]
-    
-    # Plot each genotype
-    for i, genotype in enumerate(genotypes):
-        genotype_data = df_drought[df_drought['Genotype'] == genotype]
-        
-        # Calculate mean and std for each time point
-        stats = genotype_data.groupby('Days')['Transpiration'].agg(['mean', 'std', 'count']).reset_index()
-        
-        # Calculate 95% confidence interval
-        # CI = mean ± 1.96 * (std / sqrt(n))
-        stats['ci'] = 1.96 * stats['std'] / (stats['count'] ** 0.5)
-        stats['lower'] = stats['mean'] - stats['ci']
-        stats['upper'] = stats['mean'] + stats['ci']
-        
-        # Plot mean line
-        ax.plot(stats['Days'], stats['mean'], label=genotype, color=colors[i], linewidth=2)
-        
-        # Plot confidence interval as shaded area
-        ax.fill_between(stats['Days'], stats['lower'], stats['upper'], 
-                        color=colors[i], alpha=0.2)
-    
-    ax.set_xlabel("Days since experiment start")
-    ax.set_ylabel("Daily Transpiration (g)")
-    ax.legend(loc='best', title='Genotype')
-    
-    if title:
-        ax.set_title(title)
-    else:
-        exp_num = df_drought['Experiment'].iloc[0]
-        ax.set_title(f"Drought Samples - Daily Transpiration by Genotype - Experiment {exp_num}")
-    
-    plt.tight_layout()
-    
-    if save_path:
-        fig.savefig(save_path, bbox_inches="tight")
-    
-    return fig, ax
+    return _plot_by_genotype(
+        df, 'DR_100', 'Transpiration', 'Daily Transpiration (g)',
+        'Drought Samples - Daily Transpiration by Genotype', figsize, title, save_path
+    )
 
 
 def plot_control_transpiration_df(df: pd.DataFrame, figsize=(12, 6), title=None, save_path=None):
@@ -424,54 +299,67 @@ def plot_control_transpiration_df(df: pd.DataFrame, figsize=(12, 6), title=None,
     Returns:
       (fig, ax) tuple of the created Matplotlib objects.
     """
+    return _plot_by_genotype(
+        df, 'Control', 'Transpiration', 'Daily Transpiration (g)',
+        'Control Samples - Daily Transpiration by Genotype', figsize, title, save_path
+    )
+
+
+def _plot_by_treatment(
+    df: pd.DataFrame,
+    genotype: str,
+    value_col: str,
+    ylabel: str,
+    title_template: str,
+    figsize: tuple,
+    title: str = None,
+    save_path: str = None
+) -> tuple:
+    """Common plotting logic for treatment comparison plots.
     
+    Args:
+        df: Input DataFrame
+        genotype: Genotype name to filter
+        value_col: Column name for values to plot
+        ylabel: Y-axis label
+        title_template: Template string for auto title (formatted with genotype and exp_num)
+        figsize: Figure size tuple
+        title: Optional custom title
+        save_path: Optional path to save figure
+    
+    Returns:
+        Tuple of (fig, ax)
+    """
     if df is None or df.empty:
         raise ValueError("DataFrame is empty or None")
     
-    # Filter for control samples only
-    df_control = df[df['Treatment'] == 'Control'].copy()
+    df_genotype = df[df['Genotype'] == genotype].copy()
     
-    if df_control.empty:
-        raise ValueError("No control samples found in the DataFrame")
+    if df_genotype.empty:
+        raise ValueError(f"No data found for genotype '{genotype}' in the DataFrame")
     
     fig, ax = plt.subplots(figsize=figsize)
+    treatments = sorted(df_genotype['Treatment'].unique())
     
-    # Get unique genotypes and assign colors
-    genotypes = sorted(df_control['Genotype'].unique())
-    # Use a predefined list of colors
-    color_list = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', 
-                  '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
-    colors = [color_list[i % len(color_list)] for i in range(len(genotypes))]
-    
-    # Plot each genotype
-    for i, genotype in enumerate(genotypes):
-        genotype_data = df_control[df_control['Genotype'] == genotype]
+    for treatment in treatments:
+        treatment_data = df_genotype[df_genotype['Treatment'] == treatment]
+        stats = _calculate_stats_with_ci(treatment_data, 'Days', value_col)
         
-        # Calculate mean and std for each time point
-        stats = genotype_data.groupby('Days')['Transpiration'].agg(['mean', 'std', 'count']).reset_index()
+        color = TREATMENT_COLORS.get(treatment, '#1f77b4')
+        label = 'Control' if treatment == 'Control' else 'Drought'
         
-        # Calculate 95% confidence interval
-        # CI = mean ± 1.96 * (std / sqrt(n))
-        stats['ci'] = 1.96 * stats['std'] / (stats['count'] ** 0.5)
-        stats['lower'] = stats['mean'] - stats['ci']
-        stats['upper'] = stats['mean'] + stats['ci']
-        
-        # Plot mean line
-        ax.plot(stats['Days'], stats['mean'], label=genotype, color=colors[i], linewidth=2)
-        
-        # Plot confidence interval as shaded area
-        ax.fill_between(stats['Days'], stats['lower'], stats['upper'], 
-                        color=colors[i], alpha=0.2)
+        ax.plot(stats['Days'], stats['mean'], label=label, color=color, linewidth=2)
+        ax.fill_between(stats['Days'], stats['lower'], stats['upper'], color=color, alpha=0.2)
     
     ax.set_xlabel("Days since experiment start")
-    ax.set_ylabel("Daily Transpiration (g)")
-    ax.legend(loc='best', title='Genotype')
+    ax.set_ylabel(ylabel)
+    ax.legend(loc='best', title='Treatment')
     
     if title:
         ax.set_title(title)
     else:
-        exp_num = df_control['Experiment'].iloc[0]
-        ax.set_title(f"Control Samples - Daily Transpiration by Genotype - Experiment {exp_num}")
+        exp_num = df_genotype['Experiment'].iloc[0]
+        ax.set_title(title_template.format(genotype=genotype, exp_num=exp_num))
     
     plt.tight_layout()
     
@@ -496,62 +384,11 @@ def plot_genotype_weight_df(df: pd.DataFrame, genotype: str, figsize=(12, 6), ti
     Returns:
       (fig, ax) tuple of the created Matplotlib objects.
     """
-    
-    if df is None or df.empty:
-        raise ValueError("DataFrame is empty or None")
-    
-    # Filter for the specific genotype
-    df_genotype = df[df['Genotype'] == genotype].copy()
-    
-    if df_genotype.empty:
-        raise ValueError(f"No data found for genotype '{genotype}' in the DataFrame")
-    
-    fig, ax = plt.subplots(figsize=figsize)
-    
-    # Get unique treatments and assign colors
-    treatments = sorted(df_genotype['Treatment'].unique())
-    treatment_colors = {'Control': '#2ca02c', 'DR_100': '#d62728'}  # Green for control, red for drought
-    
-    # Plot each treatment
-    for treatment in treatments:
-        treatment_data = df_genotype[df_genotype['Treatment'] == treatment]
-        
-        # Calculate mean and std for each time point
-        stats = treatment_data.groupby('Days')['Weight'].agg(['mean', 'std', 'count']).reset_index()
-        
-        # Calculate 95% confidence interval
-        # CI = mean ± 1.96 * (std / sqrt(n))
-        stats['ci'] = 1.96 * stats['std'] / (stats['count'] ** 0.5)
-        stats['lower'] = stats['mean'] - stats['ci']
-        stats['upper'] = stats['mean'] + stats['ci']
-        
-        # Get color for this treatment
-        color = treatment_colors.get(treatment, '#1f77b4')
-        
-        # Plot mean line
-        label = 'Control' if treatment == 'Control' else 'Drought'
-        ax.plot(stats['Days'], stats['mean'], label=label, color=color, linewidth=2)
-        
-        # Plot confidence interval as shaded area
-        ax.fill_between(stats['Days'], stats['lower'], stats['upper'], 
-                        color=color, alpha=0.2)
-    
-    ax.set_xlabel("Days since experiment start")
-    ax.set_ylabel("Weight (g)")
-    ax.legend(loc='best', title='Treatment')
-    
-    if title:
-        ax.set_title(title)
-    else:
-        exp_num = df_genotype['Experiment'].iloc[0]
-        ax.set_title(f"Weight for {genotype} - Control vs Drought - Experiment {exp_num}")
-    
-    plt.tight_layout()
-    
-    if save_path:
-        fig.savefig(save_path, bbox_inches="tight")
-    
-    return fig, ax
+    return _plot_by_treatment(
+        df, genotype, 'Weight', 'Weight (g)',
+        'Weight for {genotype} - Control vs Drought - Experiment {exp_num}',
+        figsize, title, save_path
+    )
 
 
 def plot_genotype_transpiration_df(df: pd.DataFrame, genotype: str, figsize=(12, 6), title=None, save_path=None):
@@ -569,62 +406,11 @@ def plot_genotype_transpiration_df(df: pd.DataFrame, genotype: str, figsize=(12,
     Returns:
       (fig, ax) tuple of the created Matplotlib objects.
     """
-    
-    if df is None or df.empty:
-        raise ValueError("DataFrame is empty or None")
-    
-    # Filter for the specific genotype
-    df_genotype = df[df['Genotype'] == genotype].copy()
-    
-    if df_genotype.empty:
-        raise ValueError(f"No data found for genotype '{genotype}' in the DataFrame")
-    
-    fig, ax = plt.subplots(figsize=figsize)
-    
-    # Get unique treatments and assign colors
-    treatments = sorted(df_genotype['Treatment'].unique())
-    treatment_colors = {'Control': '#2ca02c', 'DR_100': '#d62728'}  # Green for control, red for drought
-    
-    # Plot each treatment
-    for treatment in treatments:
-        treatment_data = df_genotype[df_genotype['Treatment'] == treatment]
-        
-        # Calculate mean and std for each time point
-        stats = treatment_data.groupby('Days')['Transpiration'].agg(['mean', 'std', 'count']).reset_index()
-        
-        # Calculate 95% confidence interval
-        # CI = mean ± 1.96 * (std / sqrt(n))
-        stats['ci'] = 1.96 * stats['std'] / (stats['count'] ** 0.5)
-        stats['lower'] = stats['mean'] - stats['ci']
-        stats['upper'] = stats['mean'] + stats['ci']
-        
-        # Get color for this treatment
-        color = treatment_colors.get(treatment, '#1f77b4')
-        
-        # Plot mean line
-        label = 'Control' if treatment == 'Control' else 'Drought'
-        ax.plot(stats['Days'], stats['mean'], label=label, color=color, linewidth=2)
-        
-        # Plot confidence interval as shaded area
-        ax.fill_between(stats['Days'], stats['lower'], stats['upper'], 
-                        color=color, alpha=0.2)
-    
-    ax.set_xlabel("Days since experiment start")
-    ax.set_ylabel("Daily Transpiration (g)")
-    ax.legend(loc='best', title='Treatment')
-    
-    if title:
-        ax.set_title(title)
-    else:
-        exp_num = df_genotype['Experiment'].iloc[0]
-        ax.set_title(f"Daily Transpiration for {genotype} - Control vs Drought - Experiment {exp_num}")
-    
-    plt.tight_layout()
-    
-    if save_path:
-        fig.savefig(save_path, bbox_inches="tight")
-    
-    return fig, ax
+    return _plot_by_treatment(
+        df, genotype, 'Transpiration', 'Daily Transpiration (g)',
+        'Daily Transpiration for {genotype} - Control vs Drought - Experiment {exp_num}',
+        figsize, title, save_path
+    )
 
 
 def read_weather_station_csv(weather_csv_path: str, experiment_num: int, resample_freq: str = "2H") -> pd.DataFrame:
@@ -650,21 +436,16 @@ def read_weather_station_csv(weather_csv_path: str, experiment_num: int, resampl
         - VPD: Vapor Pressure Deficit (kPa)
         - Experiment: Experiment number (1, 2, or 3)
     """
-    
-    # Validate path
     if not os.path.exists(weather_csv_path):
         raise FileNotFoundError(f"Weather station CSV not found: {weather_csv_path}")
     
-    # Read the weather CSV
     df_weather = pd.read_csv(weather_csv_path)
     if "Timestamp" not in df_weather.columns:
         raise ValueError("Expected a 'Timestamp' column in the weather CSV")
     
-    # Parse timestamps and set as index
     df_weather["Timestamp"] = pd.to_datetime(df_weather["Timestamp"])
     df_weather = df_weather.set_index("Timestamp").sort_index()
     
-    # Rename columns to simpler names (remove the full prefix)
     column_mapping = {}
     for col in df_weather.columns:
         if 'PARLight' in col:
@@ -677,27 +458,14 @@ def read_weather_station_csv(weather_csv_path: str, experiment_num: int, resampl
             column_mapping[col] = 'VPD'
     
     df_weather = df_weather.rename(columns=column_mapping)
-    
-    # Convert all columns to numeric
     df_weather = df_weather.apply(pd.to_numeric, errors="coerce")
-    
-    # Resample to the requested frequency (take mean of each interval)
     df_resampled = df_weather.resample(resample_freq, label="left", closed="left").mean()
     
-    # Calculate days since experiment start
     days_since_start = (df_resampled.index - df_resampled.index.min()).total_seconds() / (24 * 3600)
     df_resampled["Days"] = days_since_start
-    
-    # Add experiment number
     df_resampled['Experiment'] = experiment_num
-    
-    # Reset index to have Days as a regular column
     df_resampled = df_resampled.reset_index(drop=True)
-    
-    # Reorder columns for clarity
     df_resampled = df_resampled[['Days', 'PARLight', 'RH', 'Temp', 'VPD', 'Experiment']]
-    
-    # Remove rows with all NaN values
     df_resampled = df_resampled.dropna(how='all', subset=['PARLight', 'RH', 'Temp', 'VPD'])
     
     return df_resampled
@@ -727,22 +495,18 @@ def plot_weather_station_data(df: pd.DataFrame, figsize=(12, 10), title=None, sa
     
     fig, axes = plt.subplots(4, 1, figsize=figsize, sharex=True)
     
-    # Plot PAR Light
     axes[0].plot(df['Days'], df['PARLight'], color='#ff7f0e', linewidth=1)
     axes[0].set_ylabel('PAR Light\n(µmol/m²/s)')
     axes[0].grid(True, alpha=0.3)
     
-    # Plot Relative Humidity
     axes[1].plot(df['Days'], df['RH'], color='#2ca02c', linewidth=1)
     axes[1].set_ylabel('Relative Humidity\n(%)')
     axes[1].grid(True, alpha=0.3)
     
-    # Plot Temperature
     axes[2].plot(df['Days'], df['Temp'], color='#d62728', linewidth=1)
     axes[2].set_ylabel('Temperature\n(°C)')
     axes[2].grid(True, alpha=0.3)
     
-    # Plot VPD
     axes[3].plot(df['Days'], df['VPD'], color='#9467bd', linewidth=1)
     axes[3].set_ylabel('VPD\n(kPa)')
     axes[3].set_xlabel('Days since experiment start')
@@ -788,7 +552,6 @@ def plot_weather_station_data_enhanced(dataframes_dict, show_debug=False):
             print(f"Processing: {exp_name}")
             print(f"{'='*60}")
         
-        # Find the days column dynamically
         days_col = [col for col in df.columns if 'day' in col.lower()]
         if not days_col:
             print(f"Warning: No 'Days' column found in {exp_name}")
@@ -798,22 +561,18 @@ def plot_weather_station_data_enhanced(dataframes_dict, show_debug=False):
         if show_debug:
             print(f"Days column: {days_col}")
         
-        # Get all numeric climate variables (exclude the Days column)
         climate_vars = [col for col in df.select_dtypes(include=[np.number]).columns if col != days_col and col != 'Experiment']        
         if show_debug:
             print(f"Climate variables found: {climate_vars}")
         
-        # Create integer day groups
         df['day_integer'] = np.floor(df[days_col]).astype(int)
-        
-        # Calculate daily statistics
         daily_stats = df.groupby('day_integer')[climate_vars].agg(['min', 'max', 'mean'])
         
         if show_debug:
             print(f"\nDaily statistics shape: {daily_stats.shape}")
             print(f"Day range: {daily_stats.index.min()} to {daily_stats.index.max()}")
         
-        # Plot 1: Combined overlay plot
+        # Combined overlay plot
         _, ax1 = plt.subplots(figsize=(14, 6))
         
         colors = sns.color_palette("husl", len(climate_vars))
@@ -834,28 +593,24 @@ def plot_weather_station_data_enhanced(dataframes_dict, show_debug=False):
         plt.tight_layout()
         plt.show()
         
-        # Plot 2: Individual subplots with shaded regions
+        # Individual subplots with shaded regions
         n_vars = len(climate_vars)
         fig2, axes = plt.subplots(n_vars, 1, figsize=(14, 3*n_vars), sharex=True)
         
-        # Handle single variable case
         if n_vars == 1:
             axes = [axes]
         
         for i, var in enumerate(climate_vars):
             ax = axes[i]
             
-            # Plot mean line
             ax.plot(daily_stats.index, daily_stats[(var, 'mean')], 
                    label='Mean', color='blue', linewidth=2)
             
-            # Shade the min/max region
             ax.fill_between(daily_stats.index, 
                            daily_stats[(var, 'min')], 
                            daily_stats[(var, 'max')],
                            alpha=0.3, color='lightblue', label='Min-Max Range')
             
-            # Plot min and max lines
             ax.plot(daily_stats.index, daily_stats[(var, 'min')], 
                    label='Min', color='blue', linestyle='--', alpha=0.6)
             ax.plot(daily_stats.index, daily_stats[(var, 'max')], 
